@@ -458,7 +458,7 @@ class SpellListControl(Window):
         raise NotImplementedError()
 
     async def spell_entries(self) -> List[SpellListControlSpellEntry]:
-        return await self.read_inlined_vector(0x280, 0x78, SpellListControlSpellEntry)
+        return await self.read_inlined_vector(0x300, 0x78, SpellListControlSpellEntry)
 
     async def card_size_horizontal(self) -> int:
         return await self.read_value_from_offset(0x30C, Primitive.uint32)
