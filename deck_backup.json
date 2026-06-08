@@ -10,8 +10,13 @@
     "Typhoon Attenuate": 1,
     "Typhoon Blade": 2,
     "Bunyips Rage - T03 - A": 1,
-    "Tempest": 2
+    "Lightning Bats - T05 - B": 2,
+    "Storm Lord - T05 - A": 1,
+    "Tempest": 1
   },
-  "item": {},
+  "item": {
+    "Virulent Plague - Amulet": 1,
+    "Wand-Storm-180": 1
+  },
   "tc": {}
 }

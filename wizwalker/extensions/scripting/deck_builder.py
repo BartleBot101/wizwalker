@@ -608,6 +608,10 @@ class DeckBuilder:
     async def clear_full_deck(self):
         await self.clear_deck()
         await self.clear_item_deck()
+        # TC clearing is skipped: switching to TC view via clear_deck_tcs() leaves
+        # AllPageSpellList in a broken state that prevents normal card restore.
+        # TODO: fix view-switch stability so this can be re-enabled:
+        # await self.clear_deck_tcs()
 
     async def _pred_match_template_name(self, coro: Any, template_name: str):
         # I know it works but I still don't understand predicates.
@@ -835,6 +839,9 @@ class DeckBuilder:
         memory and crashing the client. Use PageUp/PageDown UI buttons instead.
         Spell positions are precomputed before any page navigation to avoid
         re-reading the list after the vector is potentially disturbed.
+
+        Normal and tiered cards are merged into one queue sorted by page so the
+        entire spellbook is traversed in a single forward sweep.
         """
         all_spells = await self.get_graphical_spell_cards()
         spell_names = []
@@ -842,21 +849,28 @@ class DeckBuilder:
             template = await spell.spell_template()
             spell_names.append(await template.name() if template else "")
 
-        # Precompute everything before touching pages
-        normal_queue: list[tuple[int, int, tuple[int, int]]] = []  # (count, page, position)
-        tiered_queue: list[tuple[str, int]] = []
+        # Precompute page + click position for every card before touching pages.
+        # Queue entries: (page_idx, "normal", count, position)
+        #             or (page_idx, "tiered", name, count, base_position)
+        queue = []
         for name, count in section.items():
             if name in spell_names:
                 page_idx, card_idx = self.calcuate_position_of_card_in_page(spell_names, name)
                 position = await self.calculate_card_position(card_idx)
-                normal_queue.append((count, page_idx, position))
+                queue.append((page_idx, "normal", count, position))
             elif " - T" in name:
-                tiered_queue.append((name, count))
+                base_name = name[:name.find(" - T")]
+                if base_name not in spell_names:
+                    raise Exception(f"Base spell '{base_name}' not found for tiered spell '{name}'")
+                page_idx, card_idx = self.calcuate_position_of_card_in_page(spell_names, base_name)
+                base_position = await self.calculate_card_position(card_idx)
+                queue.append((page_idx, "tiered", name, count, base_position))
             else:
                 raise Exception(f"Card not found: {name}")
 
-        # Rewind to page 0 once, then advance forward in a single pass
-        normal_queue.sort(key=lambda x: x[1])
+        queue.sort(key=lambda x: x[0])
+
+        # Single forward sweep — rewind once, then only advance
         for _ in range(50):
             try:
                 prev = await _maybe_get_named_window(self._deck_config_window, "PageUp")
@@ -869,19 +883,51 @@ class DeckBuilder:
             await asyncio.sleep(0.1)
 
         current_page = 0
-        for count, page_idx, position in normal_queue:
+        for entry in queue:
+            page_idx = entry[0]
             while current_page < page_idx:
                 next_btn = await _maybe_get_named_window(self._deck_config_window, "PageDown")
                 async with self.client.mouse_handler:
                     await self.client.mouse_handler.click_window(next_btn)
                 await asyncio.sleep(0.1)
                 current_page += 1
-            async with self.client.mouse_handler:
-                for _ in range(count):
-                    await self.client.mouse_handler.click(*position)
 
-        for name, count in tiered_queue:
-            await self._add_from_tiered_spell_list(name, count)
+            if entry[1] == "normal":
+                _, _, count, position = entry
+                async with self.client.mouse_handler:
+                    for _ in range(count):
+                        await self.client.mouse_handler.click(*position)
+                        await asyncio.sleep(0.05)
+            else:
+                _, _, name, count, base_position = entry
+                # Click base spell to open the tiered variant menu
+                async with self.client.mouse_handler:
+                    await self.client.mouse_handler.click(*base_position)
+                tiered_cards = await self.tiered_spell_list_match_template(name)
+                if not tiered_cards:
+                    raise Exception(f"Tiered variant '{name}' not found in tiered spell list")
+                tiered_spells = await self.get_graphical_tiered_spell_cards()
+                tiered_names = []
+                for spell in tiered_spells:
+                    tmpl = await spell.spell_template()
+                    if tmpl:
+                        tiered_names.append(await tmpl.name())
+                _, tiered_index = self.calcuate_position_of_card_in_page(tiered_names, name)
+                tiered_position = await self.calculate_tiered_spell_card_position(tiered_index)
+                async with self.client.mouse_handler:
+                    for _ in range(count):
+                        await self.client.mouse_handler.click(*tiered_position)
+                        await asyncio.sleep(0.05)
+                # Close tiered menu; spell list stays on current_page
+                try:
+                    close_btn = await _maybe_get_named_window(
+                        self._deck_config_window, "CloseTSMPUnlockedPageButton"
+                    )
+                    async with self.client.mouse_handler:
+                        await self.client.mouse_handler.click_window(close_btn)
+                except ValueError:
+                    await self.refresh_deck_page()
+                    current_page = 0
 
     async def _add_from_spell_list(self, name: str, number_of_copies: int):
         """Add a card by clicking it in the main SpellList."""
@@ -895,10 +941,11 @@ class DeckBuilder:
         card_page, card_index_on_page = self.calcuate_position_of_card_in_page(
             list_of_spell_names, name)
         card_position_on_page = await self.calculate_card_position(card_index_on_page)
-        await self.set_page(card_page)
+        await self._go_to_spell_page(card_page)
         async with self.client.mouse_handler:
             for _ in range(number_of_copies):
                 await self.client.mouse_handler.click(*card_position_on_page)
+                await asyncio.sleep(0.05)
 
     async def _add_from_tiered_spell_list(self, name: str, number_of_copies: int):
         """Add a tiered spell variant by clicking the base spell to open the
@@ -929,7 +976,7 @@ class DeckBuilder:
         card_page, card_index_on_page = self.calcuate_position_of_card_in_page(
             list_of_spell_names, base_name)
         card_position_on_page = await self.calculate_card_position(card_index_on_page)
-        await self.set_page(card_page)
+        await self._go_to_spell_page(card_page)
 
         # Click the base spell to open the tiered spell list
         async with self.client.mouse_handler:
@@ -949,13 +996,14 @@ class DeckBuilder:
                 continue
             tiered_names.append(await template.name())
 
-        tiered_page, tiered_index = self.calcuate_position_of_card_in_page(
-            tiered_names, name)
+        # No page navigation needed: max 3 variants always fit on the first page
+        # (slots 3-5 of the 6-slot grid; slots 1-2 are spacers).
+        _, tiered_index = self.calcuate_position_of_card_in_page(tiered_names, name)
         tiered_position = await self.calculate_tiered_spell_card_position(tiered_index)
-        await self.set_tiered_spell_page(tiered_page)
         async with self.client.mouse_handler:
             for _ in range(number_of_copies):
                 await self.client.mouse_handler.click(*tiered_position)
+                await asyncio.sleep(0.05)
 
         # Close the tiered spell page and return to the normal spell list
         try:
@@ -1027,7 +1075,9 @@ class DeckBuilder:
                 await self.client.mouse_handler.click(*(sign_card.center()))
                 await asyncio.sleep(1)
 
-    async def parse_deck_cards(self) -> list:
+    async def parse_deck_cards(self, tc: bool = False) -> list:  # noqa: ARG002
+        # tc parameter is kept for API compatibility but is no longer used for filtering;
+        # switch to the correct view (view_deck_cards / view_tc_cards) before calling.
         count = await self.get_deck_count()
         if count == 0:
             return []
