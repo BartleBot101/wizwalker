@@ -9,6 +9,8 @@ from loguru import logger
 
 from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady
 from .hooks import (
+    ChatHook,
+    ChatSendHook,
     ClientHook,
     MouselessCursorMoveHook,
     PlayerHook,
@@ -17,6 +19,7 @@ from .hooks import (
     RootWindowHook,
     RenderContextHook,
     MovementTeleportHook,
+    DropsToggleHook,
     MemoryHook
 )
 from .memory_reader import MemoryReader, Primitive
@@ -29,13 +32,14 @@ class HookHandler(MemoryReader):
     """
 
     AUTOBOT_PATTERN = (
-        rb"\x48\x8B\xC4\x55\x41\x54\x41\x55\x41\x56\x41\x57......."
-        rb"\x48......\x48.......\x48\x89\x58\x10\x48\x89"
-        rb"\x70\x18\x48\x89\x78\x20.......\x48\x33\xC4....."
-        rb"..\x4C\x8B\xE9.......\x80......\x0F"
+        rb"\x48\x89\x5C\x24.\x48\x89\x74\x24.\x48\x89\x7C\x24."
+        rb"\x55\x41\x54\x41\x55\x41\x56\x41\x57"
+        rb"\x48\x8D\xAC\x24....\x48\x81\xEC...."
+        rb"\x48\x8B\x05....\x48\x33\xC4\x48\x89\x85...."
+        rb"\x4C\x8B\xF1.......\x80......\x0F\x84...."
     )
     # rounded down
-    AUTOBOT_SIZE = 3900
+    AUTOBOT_SIZE = 4100
 
     def __init__(self, process: pymem.Pymem, client):
         super().__init__(process)
@@ -189,6 +193,7 @@ class HookHandler(MemoryReader):
         await self.activate_root_window_hook(wait_for_ready=False)
         await self.activate_render_context_hook(wait_for_ready=False)
         await self.activate_movement_teleport_hook(wait_for_ready=False)
+        await self.activate_drops_toggle_hook(wait_for_ready=False)
 
         if wait_for_ready:
             wait_tasks = []
@@ -536,6 +541,39 @@ class HookHandler(MemoryReader):
 
         return addr
 
+    async def activate_drops_toggle_hook(
+        self, *, wait_for_ready: bool = False, timeout: float = None
+    ):
+        
+        if self._check_if_hook_active(DropsToggleHook):
+            raise HookAlreadyActivated("Drops toggle")
+
+        await self._check_for_autobot()
+
+        drops_toggle_hook = DropsToggleHook(self)
+        await drops_toggle_hook.hook()
+
+        self._active_hooks[DropsToggleHook] = drops_toggle_hook
+        self._base_addrs["disable_drops_bool"] = drops_toggle_hook.disable_drops_bool
+
+    async def deactivate_drops_toggle_hook(self):
+
+        if not self._check_if_hook_active(DropsToggleHook):
+            raise HookNotActive("Drops toggle")
+
+        drops_toggle_hook = self._active_hooks.pop(DropsToggleHook)
+        await drops_toggle_hook.unhook()
+
+        del self._base_addrs["disable_drops_bool"]
+
+    async def read_disable_drops_bool(self) -> int:
+        addr = self._base_addrs.get("disable_drops_bool")
+
+        if addr is None:
+            raise HookNotActive("Drops toggle")
+
+        return addr
+
     # nothing to wait for in this hook
     async def activate_mouseless_cursor_hook(self):
         """
@@ -582,3 +620,88 @@ class HookHandler(MemoryReader):
         packed_position = struct.pack("<ii", x, y)
 
         await self.write_bytes(addr, packed_position)
+
+    async def activate_chat_hook(
+        self, *, wait_for_ready: bool = True, timeout: float = None
+    ):
+        """Activate the chat hook to capture incoming directed chat messages.
+
+        The hook fires on every incoming MSG_DirectedChat, extracting the
+        sender's GID and message text to persistent export buffers.
+
+        Keyword Args:
+            wait_for_ready: Wait for the first message to arrive
+            timeout: How long to wait (None for no timeout)
+        """
+        if self._check_if_hook_active(ChatHook):
+            raise HookAlreadyActivated("Chat")
+
+        await self._check_for_autobot()
+
+        chat_hook = ChatHook(self)
+        await chat_hook.hook()
+
+        self._active_hooks[ChatHook] = chat_hook
+        self._base_addrs["chat_owner"] = chat_hook.chat_owner_addr
+        self._base_addrs["recv_source_gid"] = chat_hook.recv_source_gid
+        self._base_addrs["recv_message_buf"] = chat_hook.recv_message_buf
+        self._base_addrs["recv_message_len"] = chat_hook.recv_message_len
+        self._base_addrs["recv_counter"] = chat_hook.recv_counter
+
+        if wait_for_ready:
+            await self._wait_for_value(chat_hook.recv_counter, timeout)
+
+    async def deactivate_chat_hook(self):
+        """Deactivate the chat hook."""
+        if not self._check_if_hook_active(ChatHook):
+            raise HookNotActive("Chat")
+
+        hook = self._active_hooks.pop(ChatHook)
+        await hook.unhook()
+
+        del self._base_addrs["chat_owner"]
+        del self._base_addrs["recv_source_gid"]
+        del self._base_addrs["recv_message_buf"]
+        del self._base_addrs["recv_message_len"]
+        del self._base_addrs["recv_counter"]
+
+    async def read_chat_owner_base(self) -> int:
+        """Read the chat owner (chat module) base address.
+
+        Returns:
+            The chat module base address
+        """
+        return await self._read_hook_base_addr("chat_owner", "Chat")
+
+    async def activate_chat_send_hook(self):
+        """Activate the chat send hook on the main game loop.
+
+        This hooks the game's main loop so that send_msg() executes
+        on the main thread where chat operations are safe.
+        """
+        if self._check_if_hook_active(ChatSendHook):
+            raise HookAlreadyActivated("Chat send")
+
+        await self._check_for_autobot()
+
+        hook = ChatSendHook(self)
+        await hook.hook()
+
+        self._active_hooks[ChatSendHook] = hook
+        self._base_addrs["send_trigger"] = hook.send_trigger
+        self._base_addrs["send_struct"] = hook.send_struct
+        self._base_addrs["buddy_trigger"] = hook.buddy_trigger
+        self._base_addrs["buddy_obj"] = hook.buddy_obj
+
+    async def deactivate_chat_send_hook(self):
+        """Deactivate the chat send hook."""
+        if not self._check_if_hook_active(ChatSendHook):
+            raise HookNotActive("Chat send")
+
+        hook = self._active_hooks.pop(ChatSendHook)
+        await hook.unhook()
+
+        del self._base_addrs["send_trigger"]
+        del self._base_addrs["send_struct"]
+        del self._base_addrs["buddy_trigger"]
+        del self._base_addrs["buddy_obj"]

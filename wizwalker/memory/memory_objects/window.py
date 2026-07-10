@@ -168,7 +168,11 @@ class Window(PropertyClass):
         #  and if so check that they have it
         offset = 736
 
+<<<<<<< HEAD
         if await self.maybe_read_type_name() == "ControlText":
+=======
+        if await self.maybe_read_type_name() in ("ControlText", "ControlList"):
+>>>>>>> a71294878fe82371726b14fa9a3dac4cacbce77a
             offset = 712
 
         base_address = await self.read_base_address() + offset
@@ -195,7 +199,11 @@ class Window(PropertyClass):
         """
         offset = 736
 
+<<<<<<< HEAD
         if await self.maybe_read_type_name() == "ControlText":
+=======
+        if await self.maybe_read_type_name() in ("ControlText", "ControlList"):
+>>>>>>> a71294878fe82371726b14fa9a3dac4cacbce77a
             offset = 712
 
         address = await self.read_base_address() + offset
