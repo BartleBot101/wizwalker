@@ -4,7 +4,12 @@ from contextlib import suppress
 
 from loguru import logger
 
-from wizwalker.memory.memory_object import Primitive, DynamicMemoryObject, PropertyClass
+from wizwalker.memory.memory_object import (
+    WIDE_BUF_CHARS,
+    Primitive,
+    DynamicMemoryObject,
+    PropertyClass,
+)
 from .enums import WindowFlags, WindowStyle
 from .spell import DynamicGraphicalSpell
 from .combat_participant import DynamicCombatParticipant
@@ -176,18 +181,19 @@ class Window(PropertyClass):
         if string_len == 0:
             return ""
 
+        # NOT always a pointer: while the string's capacity still fits MSVC's inline
+        # buffer, these 16 bytes hold the characters themselves. Reading them as an
+        # address raised MemoryReadError on any control that had only ever shown a short
+        # string -- a castle row reading "Ferme" faulted at 0x006D007200650046, which is
+        # those letters. See MemoryObject._string_data_address for the layout, and for
+        # why the test is capacity rather than length.
+        string_address = await self._string_data_address(base_address, WIDE_BUF_CHARS)
+
         # wide chars take 2 bytes
-        string_len *= 2
-
-        # this is a guess, but it seems like its awlways a pointer regardless of length
-
-        string_address = await self.read_typed(base_address, Primitive.int64)
-
         try:
-            return (await self.read_bytes(string_address, string_len)).decode("utf-16")
+            return (await self.read_bytes(string_address, string_len * 2)).decode("utf-16")
         except UnicodeDecodeError:
             return ""
-        #return await self.read_wide_string_from_offset(584)
 
     async def write_maybe_text(self, text: str):
         """

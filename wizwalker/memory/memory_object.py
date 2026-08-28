@@ -17,6 +17,12 @@ from .memory_reader import MemoryReader
 
 MAX_STRING = 5_000
 
+# MSVC's std::basic_string keeps its characters inline in a 16-byte union until the
+# capacity outgrows it. _BUF_SIZE is 16 / sizeof(_Elem), so 16 narrow chars or 8 wide
+# ones. See MemoryObject._string_data_address for why capacity is what decides.
+NARROW_BUF_CHARS = 16
+WIDE_BUF_CHARS = 8
+
 
 # TODO: add .find_instances that find instances of whichever class used it
 class MemoryObject(MemoryReader):
@@ -90,19 +96,42 @@ class MemoryObject(MemoryReader):
         if string_len == 0:
             return ""
 
+        string_address = await self._string_data_address(address, WIDE_BUF_CHARS)
+
         # wide chars take 2 bytes
-        string_len *= 2
-
-        # wide strings larger than 8 bytes are pointers
-        if string_len >= 8:
-            string_address = await self.read_typed(address, Primitive.int64)
-        else:
-            string_address = address
-
         try:
-            return (await self.read_bytes(string_address, string_len)).decode(encoding)
+            return (await self.read_bytes(string_address, string_len * 2)).decode(encoding)
         except UnicodeDecodeError:
             return ""
+
+    async def _string_data_address(self, address: int, buf_chars: int) -> int:
+        """Where a std::basic_string at `address` actually keeps its characters.
+
+        MSVC lays the string out as a 16-byte union followed by size and capacity:
+
+            +0  union { _Elem _Buf[_BUF_SIZE]; _Elem *_Ptr; }
+            +16 size_type _Mysize      (number of characters)
+            +24 size_type _Myres       (capacity, in characters)
+
+        While the capacity fits the inline buffer the characters live *in* those first
+        16 bytes, and only once it outgrows them does the union hold a heap pointer.
+        Reading the union as a pointer unconditionally therefore hands back the
+        characters reinterpreted as an address, which is never mapped -- that is the
+        MemoryReadError seen reading a castle named "Ferme": the faulting address
+        30681262094352454 is 0x006D007200650046, the letters F-e-r-m.
+
+        CAPACITY, NOT LENGTH, IS THE TEST. std::basic_string never returns to the
+        inline buffer once it has allocated, so a control that has held a long string
+        keeps a heap pointer while showing a short one. Both states occur in the same
+        client: a freshly built inventory row showing "Ferme" is inline, while a spiral
+        door option showing "MeuhShu" -- the same seven characters -- is a pointer,
+        because that window previously listed "Sorcelleville". Testing the length gets
+        the second case wrong in the opposite direction.
+        """
+        capacity = await self.read_typed(address + 24, Primitive.uint64)
+        if capacity >= buf_chars:
+            return await self.read_typed(address, Primitive.int64)
+        return address
 
     async def read_wide_string_from_offset(
         self, offset: int, encoding: str = "utf-16"
@@ -153,11 +182,7 @@ class MemoryObject(MemoryReader):
         if not 1 <= string_len <= MAX_STRING:
             return ""
 
-        # strings larger than 16 bytes are pointers
-        if string_len >= 16:
-            string_address = await self.read_typed(address, Primitive.int64)
-        else:
-            string_address = address
+        string_address = await self._string_data_address(address, NARROW_BUF_CHARS)
 
         try:
             return (await self.read_bytes(string_address, string_len)).decode(encoding)
